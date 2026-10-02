@@ -302,7 +302,8 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                     f"{ref} 移交人 {frm} 不是当前保管人 {current}（移交单 {no}，保管人断链）"
                 )
                 continue
-            open_transfer = {"transfer_no": no, "from_custodian": frm, "to_custodian": to, "occurred_at": ev["occurred_at"]}
+            open_transfer = {"transfer_no": no, "from_custodian": frm, "to_custodian": to,
+                             "occurred_at": ev["occurred_at"], "event_id": ev["event_id"]}
             # 签收完成前保管人不变，仍为移交人
 
         elif et == "receive":
@@ -878,6 +879,8 @@ def get_transfer_batch(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any
             "evaluation": _batch_item_summary(conn, result, sample),
         })
 
+    from .reconciliations import reconciliation_summary
+
     return {
         "batch_id": batch["batch_id"],
         "occurred_at": batch["occurred_at"],
@@ -885,5 +888,6 @@ def get_transfer_batch(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any
         "to_custodian": batch["to_custodian"],
         "item_count": batch["item_count"],
         "created_at": batch["created_at"],
+        "reconciliation": reconciliation_summary(conn, batch["id"]),
         "items": items,
     }

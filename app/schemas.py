@@ -161,6 +161,64 @@ class TransferBatchIn(BaseModel):
     items: list[BatchTransferItemIn] = Field(..., min_length=1, description="批内各份样本（至少一份）")
 
 
+class ReconciliationItemIn(BaseModel):
+    """批量对账清单中的一份样本（收妥项或异常项二选一，按 kind 区分）。
+
+    * received（收妥项）：填写唯一事件号 event_id 与实核封签号 actual_seal_no，
+      成功时作为既有 receive 事件落库；不得填写 reason；
+    * exception（异常项）：填写非空异常原因 reason，不生成签收事件，
+      且不得填写 event_id / actual_seal_no。
+    样本编号须命中所属批次明细，整单恰好覆盖批次全部样本。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_code: str = Field(..., min_length=1, description="批内样本编号，须命中所属批次明细")
+    kind: Literal["received", "exception"] = Field(..., description="received=收妥项，exception=异常项")
+
+    # 收妥项（kind=received）
+    event_id: str | None = Field(None, min_length=1, description="收妥项唯一签收事件号（全局唯一，须未占用）")
+    actual_seal_no: str | None = Field(None, min_length=1, description="收妥项实核封签号（须与登记一致）")
+
+    # 异常项（kind=exception）
+    reason: str | None = Field(None, description="异常项原因；收妥项必须为空，异常项必填")
+
+    @model_validator(mode="after")
+    def _check_kind_payload(self) -> "ReconciliationItemIn":
+        if self.kind == "received":
+            if not self.event_id:
+                raise ValueError("收妥项（kind=received）必须提供唯一事件号 event_id")
+            if not self.actual_seal_no:
+                raise ValueError("收妥项（kind=received）必须提供实核封签号 actual_seal_no")
+            if self.reason is not None:
+                raise ValueError("收妥项（kind=received）不得填写异常原因 reason")
+        else:  # exception
+            if not (self.reason and self.reason.strip()):
+                raise ValueError("异常项（kind=exception）必须填写非空异常原因 reason")
+            if self.event_id is not None or self.actual_seal_no is not None:
+                raise ValueError("异常项（kind=exception）不得填写 event_id / actual_seal_no（不生成签收事件）")
+        return self
+
+
+class ReconciliationIn(BaseModel):
+    """接收方对一个移交批次的一次逐份批量对账提交。
+
+    * 以全局唯一签收单号 receipt_no、签收人 receiver、统一签收时间 occurred_at 提交，
+      清单必须恰好覆盖所属批次全部样本（缺项 / 重复份项 / 外来项整单拒绝）；
+    * 收妥项作为既有 receive 事件与各样本新版本同事务提交；异常项仅留对账记录；
+    * 收妥项须对应仍有效且处于该笔移交在途状态的事件，签收人/封签/时间满足单份签收规则；
+    * 一个批次只能成功对账一次；同单号同内容重试幂等返回原结果，异内容冲突；
+    * 批次不存在、事件号占用、任一收妥项不合格均整单拒绝且不留记录。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    receipt_no: str = Field(..., min_length=1, description="全局唯一签收单号，同号重试幂等")
+    receiver: str = Field(..., min_length=1, description="签收人（须等于批次接收人）")
+    occurred_at: datetime = Field(..., description="统一签收时间 ISO8601（须晚于该批次移交时间）")
+    items: list[ReconciliationItemIn] = Field(..., min_length=1, description="逐份对账清单（须恰好覆盖批次全部样本）")
+
+
 class DossierItemIn(BaseModel):
     """案卷中的一份样本：样本编号 + 可选的非负历史版本号（缺省取封存事务中的最新版本）。"""
 

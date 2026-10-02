@@ -156,6 +156,39 @@ CREATE TABLE IF NOT EXISTS person (
     created_at    TEXT NOT NULL
 );
 
+-- 批量对账（接收方对同一批次的逐份签收对账）：一个批次至多一条成功对账。
+-- 收妥项作为既有 receive 事件与各样本新版本同事务提交；异常项仅留对账记录，
+-- 不生成签收事件。同单号同内容重试幂等、异内容冲突；并发按已提交状态判定。
+CREATE TABLE IF NOT EXISTS batch_reconciliation (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_pk        INTEGER NOT NULL UNIQUE REFERENCES transfer_batch(id), -- 一个批次只能成功对账一次
+    batch_id        TEXT NOT NULL,                       -- 批次号（原始归属留痕）
+    receipt_no      TEXT NOT NULL UNIQUE,                -- 全局唯一签收单号
+    receiver        TEXT NOT NULL,                       -- 签收人（须等于批次接收人）
+    occurred_at     TEXT NOT NULL,                       -- 统一签收时间（UTC ISO8601）
+    item_count      INTEGER NOT NULL,                    -- 清单份数（覆盖批次全部样本）
+    received_count  INTEGER NOT NULL,                    -- 收妥项份数
+    exception_count INTEGER NOT NULL,                    -- 异常项份数（不生成签收事件）
+    request_hash    TEXT NOT NULL,                       -- 对账请求指纹（同单号幂等/冲突判定）
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS batch_reconciliation_item (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    reconciliation_pk INTEGER NOT NULL REFERENCES batch_reconciliation(id),
+    batch_item_pk     INTEGER NOT NULL REFERENCES transfer_batch_item(id),
+    item_index        INTEGER NOT NULL,                  -- 对应批次明细序号（0 起）
+    sample_id         INTEGER NOT NULL REFERENCES sample(id),
+    sample_code       TEXT NOT NULL,                     -- 提交时样本编号（对账原始清单留痕）
+    transfer_no       TEXT NOT NULL,                     -- 该笔移交单号（取自批次明细）
+    kind              TEXT NOT NULL CHECK (kind IN ('received','exception')),
+    event_id          TEXT,                              -- 收妥项：既有 receive 事件号（异常项为 NULL）
+    event_row_id      INTEGER REFERENCES custody_event(id), -- 收妥项 receive 事件行
+    actual_seal_no    TEXT,                              -- 收妥项：实核封签号
+    exception_reason  TEXT,                              -- 异常项：异常原因（不生成签收事件）
+    UNIQUE (reconciliation_pk, sample_code)
+);
+
 CREATE TABLE IF NOT EXISTS person_alias (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     person_pk   INTEGER NOT NULL REFERENCES person(id),
@@ -168,6 +201,8 @@ CREATE INDEX IF NOT EXISTS idx_version_sample ON sample_version(sample_id, versi
 CREATE INDEX IF NOT EXISTS idx_review_case_dossier ON review_case(dossier_pk);
 CREATE INDEX IF NOT EXISTS idx_review_opinion_review ON review_opinion(review_pk, item_index);
 CREATE INDEX IF NOT EXISTS idx_person_alias_person ON person_alias(person_pk);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_item_recon ON batch_reconciliation_item(reconciliation_pk, item_index);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_receipt ON batch_reconciliation(receipt_no);
 """
 
 # 依赖迁移新列的索引（须在旧库补列迁移完成后再创建）
@@ -177,6 +212,8 @@ POST_MIGRATION_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_event_batch ON custody_event(batch_id)",
     "CREATE INDEX IF NOT EXISTS idx_batch_item_batch ON transfer_batch_item(batch_pk, item_index)",
     "CREATE INDEX IF NOT EXISTS idx_dossier_item_dossier ON dossier_item(dossier_pk, item_index)",
+    "CREATE INDEX IF NOT EXISTS idx_reconciliation_item_recon ON batch_reconciliation_item(reconciliation_pk, item_index)",
+    "CREATE INDEX IF NOT EXISTS idx_reconciliation_receipt ON batch_reconciliation(receipt_no)",
 ]
 
 # 旧库增量补列
