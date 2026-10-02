@@ -10,10 +10,12 @@ from . import config
 from .db import db_session, init_db, row_to_dict
 from .dossiers import get_dossier, submit_dossier, verify_dossier
 from .identities import add_alias, get_person, list_persons, register_person
+from .reconciliations import get_batch_reconciliation, submit_batch_reconciliation
 from .reviews import get_review, submit_review
 from .schemas import (
     AliasIn,
     ApproveIn,
+    BatchReconciliationIn,
     CorrectionIn,
     DossierIn,
     EventIn,
@@ -57,7 +59,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="样本交接链核验服务",
     description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核与人员标识复核回避",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -227,6 +229,34 @@ def get_transfer_batch_api(batch_id: str) -> dict[str, Any]:
     """批次查询：逐份样本的当前核验结论及原事件是否仍有效（纠错后反映有效链）。"""
     with db_session() as conn:
         return {"batch": get_transfer_batch(conn, batch_id)}
+
+
+# --------------------------------------------------------------------------- 整批对账签收（批量移交到达接收方）
+
+@app.post(f"{API_PREFIX}/transfer-batches/{{batch_id}}/reconciliation", tags=["reconciliations"], status_code=201)
+def submit_batch_reconciliation_api(batch_id: str, data: BatchReconciliationIn) -> JSONResponse:
+    """同一批次到达接收方后的整批对账签收：逐份清单覆盖原批次全部样本。
+
+    * 收妥项（event_id + verified_seal_no）：须对应仍有效且处于该笔移交在途状态的事件，
+      签收人/封签/时间满足既有单份签收规则；成功时作为既有 receive 事件与各样本新版本同事务提交；
+    * 异常项（reason）：仅留对账记录、不生成签收事件；
+    * 批次不存在、缺项/重复/外来项、事件号占用、任一收妥项不合格 → 整单拒绝且不留记录
+      （409 reconciliation_rejected=已核定/事件号占用；422=清单不合法/收妥项不合格，逐项给出）；
+    * 同签收单号同内容重试 → 200 幂等返回原结果；异内容（含跨批次）→ 409 reconciliation_conflict；
+    * 一个批次只能成功对账一次：批次已对账再提交 → 409 batch_already_reconciled；
+    * 并发由 BEGIN IMMEDIATE 串行，按已提交状态判定。
+    """
+    with db_session(immediate=True) as conn:
+        reconciliation, idempotent = submit_batch_reconciliation(conn, batch_id, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"reconciliation": reconciliation, "idempotent": idempotent})
+
+
+@app.get(f"{API_PREFIX}/transfer-batches/{{batch_id}}/reconciliation", tags=["reconciliations"])
+def get_batch_reconciliation_api(batch_id: str) -> dict[str, Any]:
+    """批次对账查询：当时的收妥/异常明细（原样留痕）与各收妥事件纠错后的现时有效性。"""
+    with db_session() as conn:
+        return {"reconciliation": get_batch_reconciliation(conn, batch_id)}
 
 
 # --------------------------------------------------------------------------- 事件纠错

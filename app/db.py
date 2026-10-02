@@ -70,6 +70,39 @@ CREATE TABLE IF NOT EXISTS transfer_batch_item (
     item_index   INTEGER NOT NULL                       -- 提交顺序（0 起）
 );
 
+-- 批量移交到达后的整批对账签收（接收方）：一个批次仅一次成功对账。
+-- 接收方以全局唯一签收单号、签收人与统一签收时间，逐份提交覆盖原批次全部样本的
+-- 对账清单：收妥项落为既有 receive 事件（与各样本新版本同事务提交），
+-- 异常项仅留对账记录、不生成签收事件。失败整单拒绝且不留任何记录。
+CREATE TABLE IF NOT EXISTS batch_reconciliation (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    reconciliation_no TEXT NOT NULL UNIQUE,              -- 全局唯一签收单号（同号重试幂等/异内容冲突）
+    batch_pk          INTEGER NOT NULL UNIQUE REFERENCES transfer_batch(id), -- 一个批次只能成功对账一次
+    receiver          TEXT NOT NULL,                    -- 签收人（须匹配该份在途移交的接收人）
+    occurred_at       TEXT NOT NULL,                     -- 统一签收时间（UTC ISO8601）
+    item_count        INTEGER NOT NULL,                 -- 清单份数（=原批次份数）
+    received_count    INTEGER NOT NULL,                 -- 收妥份数
+    exception_count   INTEGER NOT NULL,                 -- 异常份数
+    request_hash      TEXT NOT NULL,                    -- 对账请求指纹（同签收单号幂等/冲突判定）
+    created_at        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS batch_reconciliation_item (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    reconciliation_pk INTEGER NOT NULL REFERENCES batch_reconciliation(id),
+    batch_item_pk     INTEGER NOT NULL REFERENCES transfer_batch_item(id),
+    item_index        INTEGER NOT NULL,                 -- 原批次明细顺序（0 起，按原批次顺序呈现）
+    sample_id         INTEGER NOT NULL REFERENCES sample(id),
+    sample_code       TEXT NOT NULL,                    -- 提交时样本编号（原始归属留痕）
+    transfer_no       TEXT NOT NULL,                    -- 原批次该份移交单号（留痕，不改写）
+    outcome           TEXT NOT NULL CHECK (outcome IN ('received','exception')),
+    event_id          TEXT,                             -- 收妥项生成的既有 receive 事件号（异常项为 NULL）
+    event_row_id      INTEGER REFERENCES custody_event(id), -- 收妥项 receive 事件行
+    verified_seal_no  TEXT,                             -- 收妥项实核封签号（异常项为 NULL）
+    reason            TEXT,                             -- 异常项原因（收妥项为 NULL）
+    UNIQUE (reconciliation_pk, sample_code)
+);
+
 -- 样本保管链版本（质控复核用）：版本 0 为登记/升级基线快照，此后每次真正提交
 -- （单事件、批量移交中该样本事件、作废/替换纠错、入库核定）追加一个不可变快照行。
 -- 版本按提交先后（id/created_at）排列，补录事件的较早发生时间不改写旧版。
@@ -177,6 +210,7 @@ POST_MIGRATION_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_event_batch ON custody_event(batch_id)",
     "CREATE INDEX IF NOT EXISTS idx_batch_item_batch ON transfer_batch_item(batch_pk, item_index)",
     "CREATE INDEX IF NOT EXISTS idx_dossier_item_dossier ON dossier_item(dossier_pk, item_index)",
+    "CREATE INDEX IF NOT EXISTS idx_recon_item_recon ON batch_reconciliation_item(reconciliation_pk, item_index)",
 ]
 
 # 旧库增量补列

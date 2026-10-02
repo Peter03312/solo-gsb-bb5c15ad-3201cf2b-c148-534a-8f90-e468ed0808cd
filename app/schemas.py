@@ -161,6 +161,61 @@ class TransferBatchIn(BaseModel):
     items: list[BatchTransferItemIn] = Field(..., min_length=1, description="批内各份样本（至少一份）")
 
 
+class BatchReconciliationItemIn(BaseModel):
+    """批量对账清单中的一份样本。
+
+    二选一形态（由 reason 是否给出区分，模型层直接校验）：
+      * 收妥项：填写唯一事件号 event_id 与实核封签号 verified_seal_no，不得填写 reason；
+        须对应原批次该份样本仍有效且处于该笔移交在途状态的事件，
+        签收人/封签/时间满足既有单份签收规则——服务层逐项核验。
+      * 异常项：填写非空 reason，不得填写 event_id/verified_seal_no；不生成签收事件。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_code: str = Field(..., min_length=1, description="原批次中的样本编号")
+    event_id: str | None = Field(None, min_length=1, description="收妥项唯一签收事件号（全局唯一，落为既有 receive 事件）")
+    verified_seal_no: str | None = Field(None, min_length=1, description="收妥项实核封签号（须与登记封签一致）")
+    reason: str | None = Field(None, description="异常项原因；收妥项必须为空，异常项必填非空")
+
+    @property
+    def is_exception(self) -> bool:
+        return self.reason is not None
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "BatchReconciliationItemIn":
+        if self.reason is not None:
+            if not self.reason.strip():
+                raise ValueError("异常项必须填写非空异常原因（reason）")
+            if self.event_id is not None or self.verified_seal_no is not None:
+                raise ValueError("异常项仅填写原因，不得携带 event_id / verified_seal_no（不生成签收事件）")
+        else:
+            missing = [n for n in ("event_id", "verified_seal_no") if getattr(self, n) is None]
+            if missing:
+                raise ValueError(f"收妥项必须填写 {', '.join(missing)}（异常项则必须填写 reason）")
+        return self
+
+
+class BatchReconciliationIn(BaseModel):
+    """同一批次到达接收方后的整批对账签收提交。
+
+    * 签收单号（reconciliation_no）全局唯一：同号同内容重试幂等返回原结果，异内容冲突；
+    * 统一签收人与统一签收时间；清单逐份覆盖原批次全部样本（缺项/重复/外来项整单拒绝）；
+    * 收妥项（带 event_id + verified_seal_no）须对应仍有效且处于该笔移交在途状态的事件，
+      签收人=在途移交接收人、实核封签=登记封签、签收时间晚于移交时间；
+      成功时各收妥项作为既有 receive 事件与各样本新版本同事务提交；
+    * 异常项（带 reason）仅留对账记录、不生成签收事件、不产生版本；
+    * 一个批次只能成功对账一次；并发按已提交状态判定；失败整单拒绝且不留记录。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reconciliation_no: str = Field(..., min_length=1, description="全局唯一签收单号，同号重试幂等")
+    receiver: str = Field(..., min_length=1, description="签收人（须匹配各收妥项在途移交的接收人）")
+    occurred_at: datetime = Field(..., description="统一签收时间 ISO8601（须晚于各份移交时间）")
+    items: list[BatchReconciliationItemIn] = Field(..., min_length=1, description="逐份对账清单（须恰好覆盖原批次全部样本）")
+
+
 class DossierItemIn(BaseModel):
     """案卷中的一份样本：样本编号 + 可选的非负历史版本号（缺省取封存事务中的最新版本）。"""
 

@@ -302,7 +302,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                     f"{ref} 移交人 {frm} 不是当前保管人 {current}（移交单 {no}，保管人断链）"
                 )
                 continue
-            open_transfer = {"transfer_no": no, "from_custodian": frm, "to_custodian": to, "occurred_at": ev["occurred_at"]}
+            open_transfer = {"transfer_no": no, "event_id": ev["event_id"], "from_custodian": frm, "to_custodian": to, "occurred_at": ev["occurred_at"]}
             # 签收完成前保管人不变，仍为移交人
 
         elif et == "receive":
@@ -817,21 +817,38 @@ def _effective_event_id(conn: sqlite3.Connection, row_id: int) -> str | None:
     原事件仍有效 → 返回原事件号；经 replace 链最终版本有效 → 返回最终事件号；
     被 void 作废（无替换后继）或链终点已失效 → None。
     """
-    first = conn.execute("SELECT event_id FROM custody_event WHERE id = ?", (row_id,)).fetchone()
-    current_evt = first["event_id"]
+    row = _effective_event_row(conn, row_id)
+    return row["event_id"] if row is not None else None
+
+
+def _effective_event_row(conn: sqlite3.Connection, row_id: int) -> sqlite3.Row | None:
+    """沿替换链（replaces_event_id）走到当前有效版本事件行；链终点已失效 → None。"""
+    first = conn.execute("SELECT * FROM custody_event WHERE id = ?", (row_id,)).fetchone()
+    if first is None:
+        return None
+    current = first
     while True:
-        cur = conn.execute(
-            "SELECT superseded_by FROM custody_event WHERE event_id = ?", (current_evt,)
-        ).fetchone()
-        if cur["superseded_by"] is None:
-            return current_evt
+        if current["superseded_by"] is None:
+            return current
         child = conn.execute(
-            "SELECT event_id FROM custody_event WHERE replaces_event_id = ? ORDER BY id ASC",
-            (current_evt,),
+            "SELECT * FROM custody_event WHERE replaces_event_id = ? ORDER BY id ASC",
+            (current["event_id"],),
         ).fetchone()
         if child is None:
             return None
-        current_evt = child["event_id"]
+        current = child
+
+
+def get_batch_item_effective_transfer(conn: sqlite3.Connection, batch_item_row_id: int) -> sqlite3.Row | None:
+    """批次明细原 transfer 事件沿替换链走到的当前有效 transfer 事件行。
+
+    原事件仍有效 → 原行；经 replace 到的有效版本 → 最终行；
+    被 void 作废（无替换后继）或终点已失效/已非 transfer → None。
+    """
+    row = _effective_event_row(conn, batch_item_row_id)
+    if row is None or row["event_type"] != "transfer":
+        return None
+    return row
 
 
 def _batch_item_summary(
@@ -886,4 +903,12 @@ def get_transfer_batch(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any
         "item_count": batch["item_count"],
         "created_at": batch["created_at"],
         "items": items,
+        "reconciliation": _batch_reconciliation_summary(conn, batch["id"]),
     }
+
+
+def _batch_reconciliation_summary(conn: sqlite3.Connection, batch_pk: int) -> dict[str, Any] | None:
+    """批次查询中的对账签收摘要（惰性导入避免循环依赖；无对账为 None）。"""
+    from .reconciliations import batch_reconciliation_summary
+
+    return batch_reconciliation_summary(conn, batch_pk)

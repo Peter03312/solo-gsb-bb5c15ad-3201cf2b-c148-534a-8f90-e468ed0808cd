@@ -282,6 +282,99 @@ def main() -> None:
         print(f"    {it['sample_code']}: 原事件 {it['event_id']} 有效={it['event_effective']}"
               f" 当前有效事件={it['current_event_id']} 结论={it['evaluation']['status']}")
 
+    # 12.6) 整批对账签收：接收方逐份提交覆盖原批次全部样本的对账清单
+    # （收妥项=唯一事件号+实核封签号，落为既有 receive 事件；异常项=原因，不生成签收事件）
+    run_r = uuid.uuid4().hex[:8]
+    r_codes = [f"API-RECON-{run_r}-{i}" for i in (1, 2, 3)]
+    for rc in r_codes:
+        call("POST", "/samples", {
+            "sample_code": rc,
+            "collected_at": "2026-09-30T01:00:00Z",
+            "collector": "王采集",
+            "seal_no": rc.replace("API-RECON-", "SEAL-RECON-"),
+        })
+    recon_batch = {
+        "batch_id": f"API-RECON-BATCH-{run_r}",
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "from_custodian": "王采集",
+        "to_custodian": "李运输",
+        "items": [
+            {"sample_code": r_codes[0], "transfer_no": f"TR-R-{run_r}-1",
+             "event_id": f"API-REVT-{run_r}-1"},
+            {"sample_code": r_codes[1], "transfer_no": f"TR-R-{run_r}-2",
+             "event_id": f"API-REVT-{run_r}-2"},
+            {"sample_code": r_codes[2], "transfer_no": f"TR-R-{run_r}-3",
+             "event_id": f"API-REVT-{run_r}-3"},
+        ],
+    }
+    s, r = call("POST", "/transfer-batches", recon_batch)
+    show("对账前置：批量移交提交", s, r, "batch", "item_count")
+
+    recon_body = {
+        "reconciliation_no": f"API-REC-{run_r}",
+        "receiver": "李运输",
+        "occurred_at": "2026-09-30T03:00:00Z",
+        "items": [
+            # 收妥项：唯一签收事件号 + 实核封签号
+            {"sample_code": r_codes[0], "event_id": f"API-RECV-{run_r}-1",
+             "verified_seal_no": r_codes[0].replace("API-RECON-", "SEAL-RECON-")},
+            {"sample_code": r_codes[1], "event_id": f"API-RECV-{run_r}-2",
+             "verified_seal_no": r_codes[1].replace("API-RECON-", "SEAL-RECON-")},
+            # 异常项：仅填原因，不生成签收事件
+            {"sample_code": r_codes[2], "reason": "到货封签破损，异常拒收待处理"},
+        ],
+    }
+    s, r = call("POST", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation", recon_body)
+    show("整批对账提交（201：2 收妥 / 1 异常）", s, r, "reconciliation", "reconciliation_no")
+    for it in r.get("reconciliation", {}).get("items", []):
+        print(f"    {it['sample_code']}: {it['outcome']} 事件={it['event_id']}"
+              f" 收妥事件现有效={it['event_effective']} 结论={it['evaluation']['status']}"
+              f" 保管人={it['evaluation']['current_custodian']}")
+
+    # 同签收单号同内容重试（items 换序）→ 200 返回原结果
+    recon_body["items"] = list(reversed(recon_body["items"]))
+    s, r = call("POST", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation", recon_body)
+    show("同单号同内容重试（200 幂等，返回原结果）", s, r, "idempotent")
+
+    # 同单号异内容（实核封签改了）→ 409 reconciliation_conflict
+    bad_rec = json.loads(json.dumps(recon_body, ensure_ascii=False))
+    for it in bad_rec["items"]:
+        if it.get("event_id") == f"API-RECV-{run_r}-1":
+            it["verified_seal_no"] = "SEAL-TAMPERED"
+    s, r = call("POST", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation", bad_rec)
+    show("同单号异内容（409 reconciliation_conflict）", s, r)
+
+    # 批次已对账，换新单号再提交 → 409 batch_already_reconciled
+    other_rec = json.loads(json.dumps(recon_body, ensure_ascii=False))
+    other_rec["reconciliation_no"] = f"API-REC-OTHER-{run_r}"
+    s, r = call("POST", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation", other_rec)
+    show("批次重复对账（409 batch_already_reconciled）", s, r)
+
+    # 不合格收妥项（缺项）→ 422 整单拒绝且不留记录（用一个未对账的新批次演示）
+    run_r2 = uuid.uuid4().hex[:8]
+    rc2 = [f"API-RECON-{run_r2}-{i}" for i in (1, 2)]
+    for x in rc2:
+        call("POST", "/samples", {
+            "sample_code": x, "collected_at": "2026-09-30T01:00:00Z",
+            "collector": "王采集", "seal_no": x.replace("API-RECON-", "SEAL-RECON-")})
+    call("POST", "/transfer-batches", {
+        "batch_id": f"API-RECON-BATCH-{run_r2}",
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "from_custodian": "王采集", "to_custodian": "李运输",
+        "items": [
+            {"sample_code": rc2[0], "transfer_no": f"TR-{run_r2}-1", "event_id": f"API-REVT-{run_r2}-1"},
+            {"sample_code": rc2[1], "transfer_no": f"TR-{run_r2}-2", "event_id": f"API-REVT-{run_r2}-2"}]})
+    s, r = call("POST", f"/transfer-batches/API-RECON-BATCH-{run_r2}/reconciliation", {
+        "reconciliation_no": f"API-REC-{run_r2}", "receiver": "李运输",
+        "occurred_at": "2026-09-30T03:00:00Z",
+        "items": [{"sample_code": rc2[0], "event_id": f"API-RECV-{run_r2}-1",
+                   "verified_seal_no": rc2[0].replace("API-RECON-", "SEAL-RECON-")}]})  # 缺第二份
+    show("缺项整单拒绝（422 reconciliation_rejected，逐项给出，不留记录）", s, r)
+
+    # 对账查询：当时的收妥/异常明细 + 各收妥事件现时有效性（纠错后反映有效链，不改写原对账）
+    s, r = call("GET", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation")
+    show("对账查询（收妥/异常明细 + 现时有效性）", s, r, "reconciliation", "reconciliation_no")
+
     # 13) 保管链版本复核（质控）：按样本编号 + 版本号查询当时的结论、原因、保管人与时间线
     print("\n=== 保管链版本复核 ===")
     s, r = call("GET", f"/samples/{code}/versions")
